@@ -1,0 +1,69 @@
+#
+# Rubocop settings.
+#
+# Mostly use the Rubocop defaults, with a few changes.
+#
+
+# Target version 2.3 is available in current distributions.
+AllCops:
+  TargetRubyVersion: 2.3
+
+# Default is unreasonably tiny at 15.
+Metrics/AbcSize:
+  Max: 40
+
+Metrics/ClassLength:
+  Max: 300
+
+Metrics/CyclomaticComplexity:
+  Max: 10
+
+# Default is rather short at 80 characters.
+Metrics/LineLength:
+  Max: 100
+
+# Default is unreasonably tiny at 10 lines.
+Metrics/MethodLength:
+  Max: 30
+
+# Default is rather small at 5 parameters.
+Metrics/ParameterLists:
+  Max: 8
+
+Metrics/PerceivedComplexity:
+  Max: 10
+
+# sprintf is what most other languages call it.
+Style/FormatString:
+  EnforcedStyle: sprintf
+
+# Allow all format string token types.
+Style/FormatStringToken:
+  Enabled: false
+
+# ?
+Style/FrozenStringLiteralComment:
+  Enabled: false
+
+# Using () for calls makes code more readable.
+Style/MethodCallWithoutArgsParentheses:
+  Enabled: false
+
+# Don't want to enforce using underscores in large numeric literals.
+Style/NumericLiterals:
+  Enabled: false
+
+# Using the return keyword makes code more readable.
+Style/RedundantReturn:
+  Enabled: false
+
+# Double quotes for consistency with other languages.
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+
+Style/TrailingCommaInHashLiteral:
+  EnforcedStyleForMultiline: comma
+
+# Allow conditions in number-line order.
+Style/YodaCondition:
+  Enabled: false

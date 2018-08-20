@@ -1,0 +1,129 @@
+#!/usr/bin/env ruby
+#
+# Run a job consisting of numbered steps.
+#
+
+raise "Do not run this as root" if ENV["USER"] == "root"
+raise "Requires Ruby 2.3 or later" unless 2.3 <= RUBY_VERSION.split(".")[0, 2].join(".").to_f
+require "English"
+require "rubygems"
+require "bundler/setup"
+require "mysql2"
+require "optparse"
+
+require "serialrun"
+
+#
+# Run the job.
+#
+def main
+  flags = read_command_flags()
+
+  database = connect_to_database(flags)
+  job = SerialRun::Job.new(flags[:name], flags[:dir], flags[:exec],
+                           database, flags[:db_host], flags[:db_name])
+  job.set_emails(flags[:email], flags[:email_error])
+  job.set_quiet() if flags[:quiet]
+  load_job_config(flags, job)
+
+  if flags[:run]
+    job.run_steps()
+  else
+    job.show_plan()
+  end
+end
+
+#
+# Read command line flags to the tool.
+#
+def read_command_flags
+  flags = { db_host: "localhost", db_name: "job_status_development",
+            db_username: "dev", db_password: "development" }
+
+  op = OptionParser.new
+  define_flags(op, flags)
+
+  errors = []
+  begin
+    op.parse(ARGV)
+  rescue OptionParser::ParseError => error
+    errors.push(error)
+  end
+
+  errors.push("--name=NAME is required") if flags[:name].nil?
+  unless flags[:dir].nil? ^ flags[:exec].nil?
+    errors.push("--dir=PATH or --exec=COMMAND is required")
+  end
+  if !flags[:email].nil? && !flags[:email_error].nil?
+    errors.push("--email and --email-error can not be combined")
+  end
+
+  if errors != []
+    puts(errors)
+    puts("")
+    puts(op.help)
+    exit
+  end
+
+  return flags
+end
+
+#
+# Define command line flags.
+#
+def define_flags(parser, flags)
+  set_flag = flags.method(:store).curry
+
+  parser.on("--name=NAME", "Job name", set_flag.call(:name))
+  parser.on("--dir=PATH", "Directory containing job steps", set_flag.call(:dir))
+  parser.on("--exec=COMMAND", "Single command to run instead of directory", set_flag.call(:exec))
+  parser.on("--config=FILE", "Configuration file for job flags", set_flag.call(:config))
+  parser.on("--run", "Really run job (not just explain what will run)", set_flag.call(:run))
+  parser.on("--quiet", "Show only final status, not while running", set_flag.call(:quiet))
+  parser.on("--email=EMAIL", "Email final status to EMAIL", set_flag.call(:email))
+  parser.on("--email-error=EMAIL", "Email error status to EMAIL", set_flag.call(:email_error))
+  parser.on("--db-host=HOST", "Status database hostname", set_flag.call(:db_host))
+  parser.on("--db-name=NAME", "Status database name", set_flag.call(:db_name))
+  parser.on("--db-username=USER", "Status database user", set_flag.call(:db_username))
+  parser.on("--db-password=PASS", "Status database password", set_flag.call(:db_password))
+  parser.on("--prod", "Short for --run --quiet --db-name=job_status_production") do
+    flags[:run] = true
+    flags[:quiet] = true
+    flags[:db_name] = "job_status_production"
+  end
+  parser.on_tail("--help", "Display this help and exit") do
+    puts(parser.help)
+    exit
+  end
+  parser.on_tail("--version", "Display utility version and exit") do
+    puts(SerialRun::VERSION)
+    exit
+  end
+end
+
+#
+# Connect to the job status database.
+#
+def connect_to_database(flags)
+  db = Mysql2::Client.new(host: flags[:db_host], username: flags[:db_username],
+                          password: flags[:db_password], database: flags[:db_name],
+                          connect_timeout: 10,
+                          database_timezone: :utc)
+  db.query("SET SESSION time_zone = '+00:00'")
+  return db
+end
+
+#
+# Load job configuration if specified (--config flag).
+#
+# The job configuration is a ruby script that must define a FLAGS constant.
+#
+def load_job_config(flags, job)
+  return if flags[:config].nil?
+
+  config_module = Module.new()
+  config_module.module_eval(File.read(flags[:config]), flags[:config])
+  job.config = config_module
+end
+
+main()

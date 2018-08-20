@@ -1,0 +1,19 @@
+#!/bin/bash
+
+set -e
+
+while (( "$#" )); do
+  case "$1" in
+    --root=*)
+      root=${1#--root=}
+      shift
+      ;;
+    -*|--*=)
+      echo "Error: unknown flag $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+cd "$root"
+bundler exec rake spec
