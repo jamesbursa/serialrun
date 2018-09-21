@@ -1,15 +1,22 @@
 #
 # SerialRun classes to represent and run a job.
 #
+# Conventions used:
+# * All times in UTC.
+# * All durations and CPU usage times in milliseconds.
+#
 
 require "pony"
 require "socket"
 require "tempfile"
 
+require "serialrun/utils"
 require "serialrun/version"
 
 module SerialRun
   HOSTNAME = Socket.gethostname().freeze
+  TICKS_PER_SEC = Process.clock_getres(:TIMES_BASED_CLOCK_PROCESS_CPUTIME_ID, :hertz)
+  PAGESIZE = Integer(`getconf PAGESIZE`)
   LINE = ("-" * 80).freeze
 
   #
@@ -67,7 +74,7 @@ module SerialRun
     #
     def show_plan
       @steps = read_steps()
-      print_status()
+      print_status(plan: true)
       puts("Showing plan only; add flag --run to really run job:")
       puts("  #{$PROGRAM_NAME} --run #{@argv.join(' ')}")
     end
@@ -95,6 +102,15 @@ module SerialRun
           end
         end
       end
+      @steps.each do |step_group|
+        step_group.each do |step|
+          puts(step.name)
+          puts(step.cpu_ts.inspect)
+          puts(step.rss_ts.inspect)
+          puts(step.rchar_ts.inspect)
+          puts(step.wchar_ts.inspect)
+        end
+      end
     end
 
     #
@@ -115,13 +131,13 @@ module SerialRun
         end
       end
 
-      t0 = Time.now()
+      t0 = Time.now.utc
       @steps.each do |step_group|
         @status, @failed_steps = run_step_group(step_group)
         break if @status != :ok
       end
       done = true
-      @duration = Time.now() - t0
+      @duration = Integer((Time.now.utc - t0) * 1000)
       set_job_status()
     end
 
@@ -150,6 +166,7 @@ module SerialRun
       end
       trap("CLD") do
         begin
+          step_group.each { |step| step.record_stats(true) }
           # In some cases, Linux sends one SIGCLD even when multiple children exited (for example
           # when they exit at exactly the same time). Collect all children that have terminated by
           # using Process.wait2 with WNOHANG.
@@ -166,9 +183,7 @@ module SerialRun
       end
       while running != 0
         sleep(0.005)
-        step_group.each do |step|
-          step.duration = Time.now - step.started if step.status == :running
-        end
+        step_group.each(&:record_stats)
       end
       trap("CLD", "DEFAULT")
 
@@ -228,24 +243,33 @@ module SerialRun
     #
     # Show the current status of the job and all steps.
     #
-    def print_status
-      printf("%s Running job %s (from %s)\n\n", Time.now.strftime("%Y-%m-%d %H:%M:%S"), @name,
+    def print_status(plan: false)
+      printf("%s Running job %s (from %s)\n\n", Time.now.utc.strftime("%Y-%m-%d %H:%M:%S"), @name,
              @dir.nil? ? @exec : @dir)
-      print(status_string())
+      print(status_string(plan))
       print("\n")
     end
 
     #
     # Make the current status as a string.
     #
-    def status_string
+    def status_string(plan)
       s = ""
       @steps.each do |step_group|
         step_group.each do |step|
           marker = task_marker_string(step == step_group.first, step == step_group.last)
-          s += sprintf("  %1s %-40s %-10s %8.2fs  %s\n", marker,
-                       step.name, step.status.to_s.upcase,
-                       step.duration.nil? ? 0 : step.duration, step.flags.join(" "))
+          s += sprintf("  %1s %-40s %-10s",
+                       marker, step.name, step.status.to_s.upcase)
+          unless plan
+            s += sprintf(" %8.2fs %4i%% %4s r%4s w%4s",
+                         step.duration.nil? ? 0 : step.duration / 1000.0,
+                         step.current_cpu_usage() * 100,
+                         step.rss.nil? ? "" : SerialRun.format_size(step.rss),
+                         step.rchar.nil? ? "" : SerialRun.format_size(step.rchar),
+                         step.wchar.nil? ? "" : SerialRun.format_size(step.wchar))
+          end
+          s += sprintf("  %s\n",
+                       step.flags.join(" "))
         end
       end
       return s
@@ -289,7 +313,7 @@ module SerialRun
 
     def status_email_subject
       return sprintf("Job %s: %s (%.2fs)",
-                     @status.to_s.upcase, @name, @duration)
+                     @status.to_s.upcase, @name, @duration / 1000.0)
     end
 
     def status_email_body
@@ -305,7 +329,7 @@ module SerialRun
         Hostname: #{HOSTNAME}
         Username: #{ENV['USER']}
         Status: #{@status.to_s.upcase}
-        Duration: #{sprintf('%.3fs', @duration)}
+        Duration: #{sprintf('%.3fs', @duration / 1000.0)}
 
         #{status_string()}
         #{LINE}
@@ -338,8 +362,8 @@ module SerialRun
   # Represent a step of the job.
   #
   class Step
-    attr_reader :name, :flags, :status, :duration, :log, :pid, :started
-    attr_writer :duration
+    attr_reader :name, :flags, :status, :duration, :log, :pid, :started, :stime, :utime, :cpu_ts
+    attr_reader :rss, :rss_ts, :rchar, :wchar, :rchar_ts, :wchar_ts
 
     def initialize(id, number, file, name, flags)
       @id = id
@@ -350,6 +374,16 @@ module SerialRun
       @status = :pending
       @started = nil
       @duration = nil
+      @stime = nil
+      @utime = nil
+      @cpu_ts = TimeSeries.new(true)
+      @last_record_stats = nil
+      @rss = nil
+      @rss_ts = TimeSeries.new()
+      @rchar = nil
+      @wchar = nil
+      @rchar_ts = TimeSeries.new(true)
+      @wchar_ts = TimeSeries.new(true)
       @exit_status = nil
       @log = nil
     end
@@ -384,19 +418,14 @@ module SerialRun
     # Run a step by fork and exec.
     #
     def run
-      extension = File.extname(@file)[1..-1]
       @temp_log_file = Tempfile.new("step")
       @status = :running
-      @started = Time.now
+      @started = Time.now.utc
       write_start_to_database()
       @pid = fork do
         $stdout.reopen(@temp_log_file)
         $stderr.reopen($stdout)
-        if extension == "rb"
-          exec("ruby", @file, *@flags)
-        else
-          exec("./#{@file}", *@flags)
-        end
+        exec("./#{@file}", *@flags)
       end
     end
 
@@ -404,11 +433,66 @@ module SerialRun
       @update_start.execute(@status.to_s, @started.utc.strftime("%Y%m%d%H%M%S"), @job_id, @id)
     end
 
+    def record_stats(force = false)
+      return unless @status == :running
+      @duration = Integer((Time.now.utc - @started) * 1000)
+      return unless record_stats_now?(force)
+      begin
+        stat = File.open("/proc/#{@pid}/stat").readline.split
+      rescue Errno::ESRCH
+        # Process has exited already.
+        return
+      end
+      @utime = Integer((Integer(stat[13]) + Integer(stat[15])) / TICKS_PER_SEC * 1000)
+      @stime = Integer((Integer(stat[14]) + Integer(stat[16])) / TICKS_PER_SEC * 1000)
+      @rss = Integer(stat[23]) * PAGESIZE
+      @cpu_ts.push(@duration, @utime + @stime)
+      @rss_ts.push(@duration, @rss)
+      read_io_stats()
+      @last_record_stats = @duration
+    end
+
+    def record_stats_now?(force)
+      return true if force
+      return true if @last_record_stats.nil?
+      # Every 0.1s for first 10s, then every 1s until 10m, then every 10s.
+      return @last_record_stats + 100 <= @duration if @duration <= 10000
+      return @last_record_stats + 1000 <= @duration if @duration <= 600000
+      return @last_record_stats + 10000 <= @duration
+    end
+
+    def read_io_stats
+      io_stats = {}
+      begin
+        File.open("/proc/#{@pid}/io").readlines.each do |line|
+          name, value = line.chomp.split(": ")
+          io_stats[name] = value.to_i
+        end
+      rescue Errno::EACCES
+        # When the process has already exited, but is still being waited for,
+        # the owner of /proc/PID/io changes from the current user to root:root.
+        # This prevents it from being read, as it has permissions -r--------.
+        # That means we can't get accurate final io stats. (This does not affect
+        # CPU stats from /proc/PID/stat, which has permissions -r--r--r--.)
+        # puts("got EACCES for /proc/#{@pid}/io")
+        return
+      end
+      @rchar = io_stats["rchar"]
+      @wchar = io_stats["wchar"]
+      @rchar_ts.push(@duration, @rchar)
+      @wchar_ts.push(@duration, @wchar)
+    end
+
+    def current_cpu_usage
+      return @cpu_ts.current_rate() if @status == :running
+      return @cpu_ts.total_rate()
+    end
+
     def done(process_status)
       @status = :done
       @exit_status = process_status.exitstatus
       @status = @exit_status.zero? ? :ok : :error
-      @duration = Time.now - @started
+      @duration = Integer((Time.now.utc - @started) * 1000)
       @temp_log_file.open()
       @log = @temp_log_file.read()
       @temp_log_file.close()
@@ -417,6 +501,38 @@ module SerialRun
 
     def write_done_to_database
       @update_done.execute(@status.to_s, @duration, @log, @job_id, @id)
+    end
+  end
+
+  #
+  # Represent a monitoring time series for a step.
+  #
+  class TimeSeries
+    def initialize(zero_start = false)
+      @time = []   # integer milliseconds since step start
+      @value = []  # integer value of metric (e.g. bytes, CPU milliseconds)
+      push(0, 0) if zero_start
+    end
+
+    def push(time, value)
+      @time.push(time)
+      @value.push(value)
+    end
+
+    def current_rate
+      return 0 if @time.length < 2
+      time_delta = @time[-1] - @time[-2]
+      delta = @value[-1] - @value[-2]
+      return 0 if time_delta.zero?
+      return Float(delta) / time_delta
+    end
+
+    def total_rate
+      return 0 if @time.length < 2
+      time_delta = @time[-1]
+      delta = @value[-1]
+      return 0 if time_delta.zero?
+      return Float(delta) / time_delta
     end
   end
 end
